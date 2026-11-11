@@ -1,6 +1,6 @@
 # Action Item Extractor
 
-Paste rough meeting notes and get a saved checklist of tasks, owners, and deadlines. Check off completed tasks or reopen them. The original notes and the model’s extracted fields stay as submitted and returned.
+Paste rough meeting notes and get a saved checklist of tasks, owners, and deadlines. Check off completed tasks or reopen them. The original notes and the extracted fields are preserved.
 
 ## Run locally
 
@@ -11,7 +11,7 @@ npm ci
 cp .env.example .env.local
 ```
 
-Create a key in [Groq Console](https://console.groq.com/keys), then put it in `LLM_API_KEY` in `.env.local`. The example config uses GPT-OSS 20B, which is listed in [Groq’s free-tier limits](https://console.groq.com/docs/rate-limits). Keep the key in this server-side file.
+For the hosted option, put your [Groq key](https://console.groq.com/keys) in `LLM_API_KEY` in `.env.local`. The example uses GPT-OSS 20B, which is listed in [Groq’s free-tier limits](https://console.groq.com/docs/rate-limits). For the measured setup without an API key, use the local model below.
 
 ```sh
 npm run dev
@@ -21,31 +21,37 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Select **Use example** or p
 
 For a production build, run `npm run build` followed by `npm start`. Use this mode to measure latency without development compilation.
 
-### Run with a local model
+### Run with the verified local model
 
-With [Ollama](https://ollama.com/download) running, pull a small instruction model:
+Download [llama.cpp b12283](https://github.com/ggml-org/llama.cpp/releases/tag/b12283) for your OS and these two matching model files (about 4.7 GB total): [Gemma 4 E4B IT Q4_0](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/27cd6836f8e2a6e5e6b57ea0e77fa72490706985/gemma-4-E4B-it-Q4_0.gguf) and its [draft model](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/27cd6836f8e2a6e5e6b57ea0e77fa72490706985/mtp-gemma-4-E4B-it-Q4_0.gguf). From the directory containing the two files, run this with `llama-server` on your path:
 
 ```sh
-ollama pull qwen2.5:1.5b-instruct
+llama-server -m gemma-4-E4B-it-Q4_0.gguf -md mtp-gemma-4-E4B-it-Q4_0.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 6 --reasoning off \
+  --host 127.0.0.1 --port 11441 --alias gemma-4-e4b --offline --no-webui \
+  --n-gpu-layers all --parallel 1 -c 8192 --swa-full --cache-ram 0 --ctx-checkpoints 0
 ```
 
-Set these values in `.env.local` and restart the app. The base URL should end in `/v1`.
+In the app's `.env.local`, set:
 
 ```dotenv
-LLM_BASE_URL=http://127.0.0.1:11434/v1
-LLM_MODEL=qwen2.5:1.5b-instruct
+LLM_BASE_URL=http://127.0.0.1:11441/v1
+LLM_MODEL=gemma-4-e4b
+LLM_OUTPUT_MODE=llama-compact
 LLM_API_KEY=
 ```
 
-Any compatible server supporting chat completions and JSON object mode can be used. The live checks used [llama.cpp](https://github.com/ggml-org/llama.cpp) with a Qwen2.5 1.5B Instruct model and the same request format. Give a local model a short warmup request. If it needs more time, set `EXTRACTION_TIMEOUT_MS=5000` for local evaluation. That intentionally relaxes the two-second target.
+Run `npm run dev` to use the app. Before trying a full note, submit a short note such as “Mia will send the agenda by Tuesday,” or run the live check below, which warms the model for you. Other OpenAI-compatible servers can use `LLM_OUTPUT_MODE=object` with their own base URL and model.
 
 ## API and data
 
-- **`POST /notes/extract`** accepts `{"text":"Ana will check export timings by Friday."}`. The server asks the configured LLM for `{"items":[{"title":"Check export timings","owner":"Ana","due":"Friday"}]}`. A successful response is HTTP 201 with a `note` containing `id`, `text`, `createdAt`, and `items`. Missing owners and deadlines are `null`; a valid empty list saves the note with zero items. Relative deadlines stay as written.
+- **`POST /notes/extract`** accepts `{"text":"Ana will check export timings by Friday."}`. A successful response is HTTP 201 with a `note` containing `id`, `text`, `createdAt`, and `items`. Each item has `title`, `owner`, `due`, `id`, and `done`. Missing owners and deadlines are `null`; a valid empty list saves the note with zero items. Relative deadlines stay as written.
 - **`GET /api/notes`** returns saved notes with their items, newest first.
 - **`PATCH /api/items/:id`** accepts only `{"done":true}` or `{"done":false}`. The app has no endpoint for editing extracted content.
 
 The server validates the entire model result before opening a SQLite transaction. Missing fields, extra fields, incomplete output, or a malformed item reject the whole extraction. Inserting the note and every item is one transaction. Invalid input returns 400, unusable output returns 422, a provider failure returns 502, and a deadline returns 504. Missing provider configuration returns 503. A write failure returns 500 and rolls back any partial insert. The UI keeps the text available to retry after an error.
+
+Object mode returns named JSON fields. The local model returns compact `[title, owner, deadline]` rows to avoid decoding repeated keys. The server maps rows to the same API shape and treats JSON `null` and the string `"null"` as missing values in those rows. The original response is logged unchanged.
 
 Each extraction request writes a JSON log line to the server terminal with the original `noteText`, full `rawResponse` body and exact `modelOutput` when received, timing, outcome, and a request ID. If a response stops midway, the line records the received prefix and flags it as truncated. Failed extraction data stays out of SQLite. **The logs contain meeting content.** Keep them local and use sample notes for review. The app sends notes to the provider configured in `.env.local`.
 
@@ -58,11 +64,19 @@ npm test
 
 The test command builds the app and starts it on a temporary port against a local provider fixture. It needs no API key. It covers the exact extraction endpoint, invalid output and timeout rejection, preservation of the raw audit response, completion-only updates, and persistence after a restart. The fixture lives in the test suite. The normal app always calls the configured model.
 
-The extraction budget defaults to **1,700 ms** from handler entry, with time left for validation, a small local transaction, and the HTTP response. The server aborts slow upstream work and skips automatic retries. A provider’s queue, cold start, or a long output can exceed the budget, so a slow extraction returns an error instead of keeping the user waiting indefinitely.
+The extraction budget defaults to **1,700 ms** for object mode and **1,825 ms** for the compact local mode, leaving time for the database transaction and HTTP response. The server aborts slow upstream work and skips automatic retries. A provider’s queue, cold start, or a long output can exceed the budget.
 
 ### Live model check
 
-On an M1 Pro, the production build saved three short notes through Qwen2.5-1.5B in **128–919 ms**. A long note timed out at **1,710 ms**, with no new database record. Both full assignment samples reached the default deadline and returned HTTP 504 in about 1.8 seconds. With the deadline relaxed, this small model also made ownership and deadline mistakes. It works as a key-free smoke test. I’d use the configured Groq model for reviewing the longer samples and measure its latency with a key.
+With the local model running and configured in `.env.local`:
+
+```sh
+npm run test:live
+```
+
+The live check builds the production app, warms the model with a different note, then alternates the [full weekly sync](tests/fixtures/weekly-sync.txt) and [full customer call](tests/fixtures/customer-call.txt) five times each. It requires HTTP 201 in under 2 seconds, checks the tasks, owners and deadlines, and reads the saved notes back from a temporary SQLite database.
+
+On an Apple M1 Pro with 16 GB RAM, the weekly sync returned **7 tasks in 1.59–1.64 s** and the customer call returned **3 tasks in 1.20–1.25 s**, measured from the HTTP request through the full response body. The model reuses the shared prompt prefix; every note is processed and generated anew. These are warm, serial results for this setup. Other hardware and providers can differ.
 
 ## Tradeoffs
 

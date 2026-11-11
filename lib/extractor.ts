@@ -1,10 +1,12 @@
 import { z } from "zod";
+import { compactGrammar, compactMessages, compactOutput } from "./compact-extraction";
 import type { ExtractedItem } from "./contracts";
 import { BodyTooLargeError, readText } from "./http";
 
 const GROQ_URL = "https://api.groq.com/openai/v1";
 const DEFAULT_MODEL = "openai/gpt-oss-20b";
 export const DEFAULT_TIMEOUT_MS = 1700;
+const COMPACT_TIMEOUT_MS = 1825;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
 const nonBlank = (max: number) => z.string().min(1).max(max).refine((value) => value.trim().length > 0);
@@ -15,6 +17,7 @@ const outputSchema = z.strictObject({
     due: nonBlank(120).nullable(),
   })).max(40),
 });
+const objectOutput = outputSchema.transform(({ items }) => items);
 
 // Keep provider constraints to the documented structural subset. The server enforces lengths.
 const providerSchema = z.toJSONSchema(outputSchema, {
@@ -44,6 +47,8 @@ const systemPrompt = [
   "Every item has title, owner and due. Use null for an unstated owner or deadline.",
   "Keep unassigned tasks if an action was requested. Keep relative deadlines as written.",
   "Separate different tasks. Preserve named owners and avoid inventing tasks, owners, dates, or commitments.",
+  "If a person accepted only part of the work, include the remaining task separately without an owner.",
+  "A reporter, attendee, beneficiary, or unnamed narrator is not a named owner. Copy only a deadline tied to that specific task, including by/before; meeting, start and renewal dates are context.",
   "Include a proposed follow-up only when the notes call for it. Skip complaints, context, and vague discussion by themselves.",
   'If there are no action items, return {"items":[]}.',
   "Keep each title under 240 characters and owner and due under 120 characters. Return at most 40 items.",
@@ -91,7 +96,7 @@ function settings() {
   const base = process.env.LLM_BASE_URL?.trim() || GROQ_URL;
   const apiKey = process.env.LLM_API_KEY?.trim();
   const model = process.env.LLM_MODEL?.trim() || DEFAULT_MODEL;
-  const timeout = Number(process.env.EXTRACTION_TIMEOUT_MS?.trim() || DEFAULT_TIMEOUT_MS);
+  const mode = process.env.LLM_OUTPUT_MODE?.trim() || "object";
 
   let url: URL;
   try {
@@ -108,13 +113,18 @@ function settings() {
   if (url.hostname === "api.groq.com" && !apiKey) {
     throw configurationError("Add a Groq key to LLM_API_KEY in .env.local, or configure a local model.");
   }
+  if (mode !== "object" && (mode !== "llama-compact" || !local)) {
+    throw configurationError("Set LLM_OUTPUT_MODE to object, or llama-compact with a local llama.cpp server.");
+  }
+  const compact = mode === "llama-compact";
+  const timeout = Number(process.env.EXTRACTION_TIMEOUT_MS?.trim() || (compact ? COMPACT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS));
   if (!Number.isInteger(timeout) || timeout < 100 || timeout > 60_000) {
     throw configurationError("Set EXTRACTION_TIMEOUT_MS to an integer between 100 and 60000.");
   }
 
   const groqGptOss = url.hostname === "api.groq.com" && /^openai\/gpt-oss-(20|120)b$/.test(model);
   url.pathname = url.pathname.replace(/\/+$/, "") + "/chat/completions";
-  return { url, apiKey, model, timeout, groqGptOss };
+  return { url, apiKey, model, timeout, groqGptOss, compact };
 }
 
 function parseJson(text: string): unknown {
@@ -152,10 +162,14 @@ export async function extractItems(
       },
       body: JSON.stringify({
         model: config.model,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: noteText }],
-        response_format: responseFormat,
+        ...(config.compact
+          ? { messages: compactMessages(noteText), grammar: compactGrammar, cache_prompt: true }
+          : {
+              messages: [{ role: "system", content: systemPrompt }, { role: "user", content: noteText }],
+              response_format: responseFormat,
+            }),
         temperature: 0,
-        ...(config.groqGptOss ? { max_completion_tokens: 1024 } : { max_tokens: 1024 }),
+        ...(config.groqGptOss ? { max_completion_tokens: 1024 } : { max_tokens: config.compact ? 320 : 1024 }),
         stream: false,
         ...(config.groqGptOss ? { reasoning_effort: "low", include_reasoning: false } : {}),
       }),
@@ -195,11 +209,14 @@ export async function extractItems(
     throw invalidOutput("The model did not return a complete answer.");
   }
 
-  const output = outputSchema.safeParse(parseJson(audit.modelOutput));
+  const parsed = parseJson(audit.modelOutput);
+  const output = config.compact
+    ? compactOutput.safeParse(parsed)
+    : objectOutput.safeParse(parsed);
   if (!output.success) {
     const issue = output.error.issues[0];
     throw invalidOutput(`${issue.path.join(".") || "response"}: ${issue.message}`);
   }
   if (requestSignal.aborted || performance.now() - startedAt >= config.timeout) throw timeoutError();
-  return output.data.items;
+  return output.data;
 }

@@ -1,73 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
+import { startApp } from "./production-app.mjs";
 import { completionBody, startProvider } from "./provider-fixture.mjs";
-
-const host = "127.0.0.1";
-
-async function startApp(databasePath, providerUrl) {
-  const child = spawn(
-    process.execPath,
-    ["node_modules/next/dist/bin/next", "start", "-H", host, "-p", "0"],
-    {
-      cwd: new URL("../", import.meta.url),
-      env: {
-        ...process.env,
-        DATABASE_PATH: databasePath,
-        EXTRACTION_TIMEOUT_MS: "1000",
-        LLM_API_KEY: "fixture-key",
-        LLM_BASE_URL: providerUrl,
-        LLM_MODEL: "fixture-model",
-        NEXT_TELEMETRY_DISABLED: "1",
-        NODE_ENV: "production",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-
-  let stdout = "";
-  let stderr = "";
-  let spawnError;
-  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-  child.on("error", (error) => { spawnError = error; });
-  const closed = new Promise((resolve) => child.once("close", resolve));
-
-  async function stop() {
-    if (child.exitCode === null && child.signalCode === null && !child.killed) {
-      child.kill();
-    }
-    const forceStop = setTimeout(() => child.kill("SIGKILL"), 5_000);
-    try {
-      await closed;
-      return stdout;
-    } finally {
-      clearTimeout(forceStop);
-    }
-  }
-
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline && !spawnError && child.exitCode === null && child.signalCode === null) {
-    const url = stdout.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
-    if (url) {
-      try {
-        const response = await fetch(`${url}/api/notes`, { signal: AbortSignal.timeout(500) });
-        await response.text();
-        if (response.ok) return { url, stop };
-      } catch {
-        // The server may still be starting.
-      }
-    }
-    await delay(50);
-  }
-  await stop();
-  assert.fail(`Next.js did not start.\n${spawnError ?? ""}\n${stdout}\n${stderr}`);
-}
 
 async function requestJson(app, path, expectedStatus, { method = "GET", payload } = {}) {
   const response = await fetch(`${app.url}${path}`, {
@@ -103,7 +41,14 @@ test("production notes API", { timeout: 45_000 }, async (t) => {
 
   provider = await startProvider();
   const databasePath = join(temporaryDirectory, "test.sqlite");
-  app = await startApp(databasePath, provider.baseUrl);
+  const providerEnv = {
+    EXTRACTION_TIMEOUT_MS: "1000",
+    LLM_API_KEY: "fixture-key",
+    LLM_BASE_URL: provider.baseUrl,
+    LLM_MODEL: "fixture-model",
+    LLM_OUTPUT_MODE: "object",
+  };
+  app = await startApp(databasePath, providerEnv);
   const expectedAudits = [];
   let firstServerOutput = "";
 
@@ -192,7 +137,7 @@ test("production notes API", { timeout: 45_000 }, async (t) => {
     assert.deepEqual(item, { ...original, done: true });
 
     firstServerOutput = await app.stop();
-    app = await startApp(databasePath, provider.baseUrl);
+    app = await startApp(databasePath, providerEnv);
     assert.deepEqual(await listNotes(), [{ ...savedNote, items: [item, savedNote.items[1]] }]);
 
     const reopened = await requestJson(app, itemPath, 200, {
@@ -290,4 +235,46 @@ test("production notes API", { timeout: 45_000 }, async (t) => {
       expectedAudits,
     );
   });
+});
+
+test("compact model rows are validated before any write and audited verbatim", { timeout: 25_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "action-item-extractor-compact-"));
+  let provider;
+  let app;
+  t.after(async () => {
+    await app?.stop();
+    await provider?.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  provider = await startProvider();
+  app = await startApp(join(directory, "test.sqlite"), {
+    EXTRACTION_TIMEOUT_MS: "1000",
+    LLM_API_KEY: "",
+    LLM_BASE_URL: provider.baseUrl,
+    LLM_MODEL: "fixture-model",
+    LLM_OUTPUT_MODE: "llama-compact",
+  });
+  const text = "Ari will order the badges before Monday. Someone needs to book a room.";
+  const modelOutput = '[["Order the badges","Ari","before Monday"],["Book a room","null",null]]';
+  const rawResponse = completionBody(modelOutput);
+  provider.reply({ body: rawResponse });
+  const { note } = await requestJson(app, "/notes/extract", 201, { method: "POST", payload: { text } });
+  assert.equal(note.text, text);
+  assert.deepEqual(note.items.map(({ title, owner, due }) => ({ title, owner, due })), [
+    { title: "Order the badges", owner: "Ari", due: "before Monday" },
+    { title: "Book a room", owner: null, due: null },
+  ]);
+  const [first] = provider.requests;
+  assert.equal(first.body.messages.at(-1).content, text);
+  assert.equal(typeof first.body.grammar, "string");
+
+  provider.reply({ body: completionBody('[["Valid task",null,null],["Missing deadline",null]]') });
+  await requestJson(app, "/notes/extract", 422, { method: "POST", payload: { text } });
+  assert.deepEqual(await requestJson(app, "/api/notes", 200), { notes: [note] });
+
+  const [saved, rejected] = extractionAudits(await app.stop());
+  assert.equal(saved.noteText, text);
+  assert.equal(saved.rawResponse, rawResponse);
+  assert.equal(saved.modelOutput, modelOutput);
+  assert.equal(rejected.outcome, "invalid_output");
 });

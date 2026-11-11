@@ -11,12 +11,19 @@ import { MAX_NOTE_LENGTH, type ActionItem, type Note } from "../lib/contracts";
 
 const example = `weekly sync tues
 
-- deploy went out friday, mostly fine. two customers hit the timeout thing again. Ana is going to look at the retry logic, thinks it's the connection pool not the retries themselves
-- Q3 numbers are in the shared drive, everyone please actually read them before next week
-- new starter begins the 14th. someone needs to sort the laptop and the accounts, Tomaz said he'd do accounts but not the laptop
-- billing page redesign -- still blocked on copy from marketing. Marko is chasing, said he'd have an answer by Friday
+- deploy went out friday, mostly fine. two customers hit the timeout thing
+  again. Ana is going to look at the retry logic, thinks it's the connection
+  pool not the retries themselves
+- Q3 numbers are in the shared drive, everyone please actually read them
+  before next week
+- new starter begins the 14th. someone needs to sort the laptop and the
+  accounts, Tomaz said he'd do accounts but not the laptop
+- billing page redesign -- still blocked on copy from marketing. Marko is
+  chasing, said he'd have an answer by Friday
 - we skipped the retro again. Let's not skip it again.
-- Ana raised that the staging db hasn't been reset since June and it's getting slow. no owner on this yet`;
+- Ana raised that the staging db hasn't been reset since June and it's
+  getting slow. no owner on this yet
+`;
 
 const icons = {
   arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,

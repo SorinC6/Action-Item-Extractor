@@ -1,0 +1,18 @@
+call w/ Nordwind, 40 min, me + Ana
+
+they're happy overall. two complaints:
+1. export takes forever on big accounts (they have ~90k records). said
+   "it's not unusable but we run it overnight now" which is not great
+2. can't invite users without giving them admin. this is the third
+   customer to say this.
+
+they asked about SSO again. I said Q1 which I'm not sure is true -- need to
+check with product before I put that in writing anywhere.
+
+renewal is in March. Ana thinks we should get ahead of the export thing
+before then, I agree. She's going to pull the numbers on how long exports
+actually take for accounts over 50k records so we know if this is a real
+problem or a perception one.
+
+also they mentioned their new ops lead starts next month and will want a
+walkthrough. no date yet.
